@@ -412,6 +412,39 @@ cswap add-token --email user@example.com     # optional label override
 
 **Note:** Third-party providers configured through `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` are not managed or switched; those exported variables stay in effect after a switch, so unset them to use the swapped account.
 
+### Gateway accounts (custom endpoints)
+
+Point a seat at an **Anthropic-compatible gateway** (LiteLLM, a custom proxy, an on-prem endpoint, …) with its own API key, and switch to it like any other account. A gateway differs from the first-party setups above in two ways: the key can carry **any** prefix, and it is activated through a `settings.json` **overlay** rather than the credential store.
+
+```bash
+cswap add-token - --base-url https://gw.internal --alias gw      # key from stdin
+cswap add-token sk-any-thing --base-url https://gw.internal      # key as an argument
+cswap add-token - --base-url https://gw.internal --auth x-api-key  # sign with an x-api-key header
+cswap add-token - --base-url http://127.0.0.1:4000               # plain HTTP is allowed on localhost
+# Pin the gateway's own model ids (it usually doesn't know `sonnet`/`haiku`):
+cswap add-token - --base-url https://gw.internal \
+    --model qwen3.8-27b --small-model sovereign-mini
+```
+
+`--base-url` is what makes an `add-token` a gateway. The key is read the same way as any other token (argument or `-` for stdin). `--auth` is `bearer` (an `Authorization: Bearer <key>` header, the default) or `x-api-key` (an `x-api-key` header), for gateways that expect one or the other. URLs must be HTTPS — plain HTTP is accepted only for `localhost` / `127.0.0.1` — without embedded credentials, a query string, or a fragment. A trailing `/v1` is normalized away so Claude Code can append its own `/v1/…` paths.
+
+**Model names.** Claude Code sends whatever model it is configured with, verbatim — a gateway usually only knows its *own* model names, not `sonnet`/`haiku`. `--model` sets the gateway's main model id, `--small-model` the small/fast (background-task) id (defaults to the main one). On activation cswap points the top-level `model` setting at the gateway's model (your previous value is stashed and restored on deactivation) and pins `ANTHROPIC_SMALL_FAST_MODEL` + `CLAUDE_CODE_SUBAGENT_MODEL` to the small/fast id, so in-session `/model <id>` still works for picking between the gateway's models. On deactivation all model pins are cleared.
+
+<details>
+<summary>Thinking / reasoning effort on LiteLLM-style gateways</summary>
+
+Set per-model entries in `modelSettings` in `settings.json` to levels the gateway actually accepts — e.g. `"qwen3.8-27b": {"effortLevel": "medium"}` — and the same value with `/effort` in the session (which takes effect on your next message, no restart). These entries are keyed by model id, so they are inert on your subscription seats; fine to leave them in.
+</details>
+
+**How activation works.** Switching to a gateway does **not** touch `.credentials.json`; your saved Claude login stays in place. Instead cswap writes a small overlay onto Claude Code's user-level `settings.json`:
+
+- `apiKeyHelper` — a `cswap gateway-credential <slot>` command that prints the stored key, which Claude Code uses as its API key (the key itself is never written to `settings.json`).
+- `env.ANTHROPIC_BASE_URL` — the gateway's base URL.
+
+Claude Code live-reloads `settings.json`, so the change applies without restarting a session. Switching back to any Claude/account-seat tears the overlay down and sets `ANTHROPIC_BASE_URL` back to the first-party URL, so the next request routes to Anthropic again. Removing an active gateway tears the overlay down too.
+
+**Guards.** Activating a gateway refuses to run if `settings.json` already carries a non-cswap `apiKeyHelper`, or if `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN…` are set there — cswap will not silently clobber auth you configured by hand. Gateways have no first-party subscription quota, so they report usage as `gateway` and are never skipped by the usage-aware `switch` strategies as rate-limited. Gateways also travel through `export` / `import`.
+
 ## Documentation
 
 - [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.

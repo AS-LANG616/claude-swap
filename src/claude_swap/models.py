@@ -235,7 +235,7 @@ class AccountSnapshot:
     org_name: str
     org_uuid: str
     is_active: bool
-    kind: str  # "oauth" | "api_key"
+    kind: str  # "oauth" | "api_key" | "gateway"
     switchable: bool
     usage: UsageEntry
     alias: str = ""
@@ -251,10 +251,19 @@ class AccountSnapshot:
     # unreadable; see oauth.login_expires_at_epoch. Feeds the "re-login in
     # 5d 12h" note every account view shows while the login is due.
     login_expires_at: float | None = None
+    #: Gateway seat fields (``baseUrl``/``auth``), or None for OAuth/API-key
+    #: seats. Appended last and defaulted, so every construction site keeps
+    #: working; see claude_swap.gateway.
+    gateway: dict | None = None
 
     @property
     def display_tag(self) -> str:
-        """Org tag for display: the org name, or 'personal'."""
+        """Tag for display: the gateway ``host · auth`` for a gateway seat,
+        else the org name, or 'personal'."""
+        if self.gateway is not None:
+            from claude_swap import gateway as _gw
+
+            return _gw.tag(self.gateway)
         return self.org_name if self.org_name else "personal"
 
 

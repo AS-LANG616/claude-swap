@@ -244,9 +244,11 @@ def export_accounts(
 
         # API-key accounts store the credential as a raw ``sk-ant-…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
-        # below doesn't choke and import can restore it as-is.
-        is_api_key = looks_like_api_key(creds_text)
-        if is_api_key:
+        # below doesn't choke and import can restore it as-is. Gateway accounts
+        # are the same idea (raw key, any prefix) plus the endpoint metadata.
+        is_gateway = record.get("kind") == "gateway"
+        is_api_key = (not is_gateway) and looks_like_api_key(creds_text)
+        if is_gateway or is_api_key:
             creds_payload: Any = creds_text.strip()
         else:
             creds_payload = _parse_payload(creds_text, f"credentials for {email}")
@@ -262,7 +264,15 @@ def export_accounts(
             "credentials": creds_payload,
             "config": config_obj,
         }
-        if is_api_key:
+        if is_gateway:
+            entry["kind"] = "gateway"
+            entry["baseUrl"] = record.get("baseUrl")
+            entry["auth"] = record.get("auth", "bearer")
+            if record.get("model"):
+                entry["model"] = record["model"]
+            if record.get("smallFastModel"):
+                entry["smallFastModel"] = record["smallFastModel"]
+        elif is_api_key:
             entry["kind"] = "api_key"
         if record.get("alias"):
             entry["alias"] = record["alias"]
@@ -402,10 +412,21 @@ def import_accounts(
         config_obj = raw.get("config")
         if not isinstance(config_obj, dict):
             raise TransferError(f"config for {email} must be a JSON object")
-        # API-key accounts carry the credential as a raw string; OAuth accounts
-        # carry a JSON object.
-        is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
-        if is_api_key:
+        # Gateway and API-key accounts carry the credential as a raw string;
+        # OAuth accounts carry a JSON object. A gateway also has the endpoint
+        # metadata (baseUrl/auth) and may carry a raw key of ANY prefix.
+        is_gateway = raw.get("kind") == "gateway"
+        is_api_key = (
+            raw.get("kind") == "api_key"
+            or (not is_gateway and isinstance(creds_obj, str))
+        )
+        if is_gateway:
+            if not isinstance(creds_obj, str) or not creds_obj.strip():
+                raise TransferError(f"gateway key for {email} must be a non-empty raw key")
+            if not raw.get("baseUrl"):
+                raise TransferError(f"gateway account {email} is missing its base URL")
+            creds_text = creds_obj.strip()
+        elif is_api_key:
             if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
                 raise TransferError(
                     f"API-key credentials for {email} must be a raw sk-ant-… key "
@@ -449,7 +470,17 @@ def import_accounts(
                 "org_name": raw.get("organizationName", "") or "",
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
-                "kind": "api_key" if is_api_key else "oauth",
+                "kind": ("gateway" if is_gateway else ("api_key" if is_api_key else "oauth")),
+                "gateway": (
+                    {
+                        "baseUrl": raw["baseUrl"],
+                        "auth": raw.get("auth", "bearer"),
+                        "model": raw.get("model"),
+                        "smallFastModel": raw.get("smallFastModel"),
+                    }
+                    if is_gateway
+                    else None
+                ),
                 "alias": alias,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
@@ -582,6 +613,14 @@ def import_accounts(
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"
+        elif entry["kind"] == "gateway" and entry.get("gateway"):
+            new_record["kind"] = "gateway"
+            new_record["baseUrl"] = entry["gateway"]["baseUrl"]
+            new_record["auth"] = entry["gateway"].get("auth", "bearer")
+            if entry["gateway"].get("model"):
+                new_record["model"] = entry["gateway"]["model"]
+            if entry["gateway"].get("smallFastModel"):
+                new_record["smallFastModel"] = entry["gateway"]["smallFastModel"]
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
         data["accounts"][target_num] = new_record

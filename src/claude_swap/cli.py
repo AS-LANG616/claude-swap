@@ -1381,8 +1381,44 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _gateway_credential_entry() -> None:
+    """Silently emit the managed gateway key for Claude Code's ``apiKeyHelper``.
+
+    Invoked as ``cswap gateway-credential <slot>`` while Claude Code is running
+    against a gateway seat. stdout must carry the key and nothing else (a UTF-8
+    mode reset byte would corrupt the helper output), so this runs before
+    ``force_utf8_output()`` and never touches the argparse dispatch. Any failure
+    goes to stderr and exits non-zero so Claude Code sees "no API key".
+    """
+    import contextlib
+    import io
+
+    argv = sys.argv[2:]
+    key = None
+    try:
+        if len(argv) == 1 and argv[0].isdigit() and int(argv[0]) > 0:
+            from claude_swap.switcher import ClaudeAccountSwitcher
+
+            # Suppress incidental stdout while reading (only the key may print).
+            with contextlib.redirect_stdout(io.StringIO()):
+                key = ClaudeAccountSwitcher().gateway_credential(str(int(argv[0])))
+    except Exception:
+        key = None
+    if key is None or not key.strip():
+        sys.stderr.write("Gateway credentials unavailable for slot. Re-run the switch.\n")
+        sys.exit(1)
+    sys.stdout.write(key.strip())
+    sys.stdout.flush()
+    sys.exit(0)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
+    # Hidden `cswap gateway-credential <slot>` hook (see _gateway_credential_entry):
+    # handled before force_utf8_output() so it emits the key cleanly.
+    if sys.argv[1:2] == ["gateway-credential"]:
+        _gateway_credential_entry()
+        return
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
@@ -1546,7 +1582,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=(
             "With 'switch --strategy': also count these models' per-model "
             "weekly limits when comparing accounts (comma-separated display "
-            "names, or 'all'). Defaults to the autoswitch.model setting"
+            "names, or 'all'). Defaults to the autoswitch.model setting. "
+            "With 'add-token --base-url': the gateway's own main model id "
+            "(the gateway usually only knows its own names, not 'sonnet'/'haiku')"
         ),
     )
     parser.add_argument(
@@ -1747,6 +1785,23 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         const="",
         help=argparse.SUPPRESS,
     )
+    # Gateway modifiers: --base-url turns a token into a custom-endpoint
+    # (gateway) account, activated by a settings.json overlay. With
+    # 'add-token --base-url', the existing --model flag takes the gateway's
+    # own main model id (see the --model help), and --small-model the
+    # small/fast (background-task) id.
+    parser.add_argument("--base-url", metavar="URL", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--auth",
+        choices=["bearer", "x-api-key"],
+        default="bearer",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--small-model",
+        metavar="MODEL_ID",
+        help=argparse.SUPPRESS,
+    )
 
     args = parser.parse_args(argv)
 
@@ -1808,12 +1863,17 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
 
-    if args.model is not None and args.strategy is None:
+    if (
+        args.model is not None
+        and args.strategy is None
+        and args.base_url is None
+    ):
         # Meaningless on a direct-target switch or plain rotation — nothing
         # usage-aware reads it there, so reject loudly rather than ignore.
+        # (With 'add-token --base-url' it names the gateway's main model.)
         parser.error(
-            "--model can only be used with 'switch --strategy best' or "
-            "'switch --strategy next-available'"
+            "--model can only be used with 'switch --strategy best' / "
+            "'switch --strategy next-available', or with 'add-token --base-url'"
         )
 
     if args.slot is not None and not (args.add_account or args.add_token is not None):
@@ -1825,8 +1885,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
 
-    if args.alias is not None and not args.add_account:
-        parser.error("--alias can only be used with 'add'")
+    if args.alias is not None and not (args.add_account or args.add_token is not None):
+        parser.error("--alias can only be used with 'add' or 'add-token'")
+
+    if args.base_url is not None and args.add_token is None:
+        parser.error("--base-url can only be used with 'add-token'")
+    if args.auth != "bearer" and (args.add_token is None or args.base_url is None):
+        parser.error("--auth can only be used with 'add-token --base-url'")
+    if args.small_model is not None and (args.add_token is None or args.base_url is None):
+        parser.error("--small-model can only be used with 'add-token --base-url'")
 
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
@@ -1896,6 +1963,13 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 token=args.add_token,
                 email=args.email,
                 slot=args.slot,
+                base_url=args.base_url,
+                auth=args.auth,
+                alias=args.alias,
+                # With a gateway, --model names the gateway's main model id
+                # (not usage limits — there are none on a gateway seat).
+                model=args.model if args.base_url is not None else None,
+                small_fast_model=args.small_model,
             )
         elif args.remove_account:
             switcher.remove_account(args.remove_account)

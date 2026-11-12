@@ -25,6 +25,10 @@ USAGE_TOKEN_EXPIRED = "token expired"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
+# Gateway accounts (custom endpoint via a settings.json overlay) have no
+# first-party quota either; the key is opaque to the first-party usage API, so
+# usage is reported as this sentinel instead of being fetched.
+USAGE_GATEWAY = "gateway"
 # The active account's macOS Keychain was unreadable (locked / denied / timeout)
 # with no plaintext fallback — distinct from a genuinely empty slot, so the user
 # isn't misled into an unnecessary re-login.
@@ -275,6 +279,8 @@ def usage_fields(
         return "token_expired", None
     if entry == USAGE_API_KEY:
         return "api_key", None
+    if entry == USAGE_GATEWAY:
+        return "gateway", None
     if entry == USAGE_KEYCHAIN_UNAVAILABLE:
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:
@@ -388,6 +394,7 @@ def account_row(
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
     subscription_plan: dict | None = None,
+    gateway: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -402,6 +409,11 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if gateway is not None:
+        # Additive gateway fields: present only for a custom-endpoint seat, so
+        # rows for OAuth/API-key seats are untouched.
+        row["kind"] = "gateway"
+        row["gateway"] = gateway
     if alias:
         row["alias"] = alias
     # Additive field: present only when the slot is held out of rotation, so

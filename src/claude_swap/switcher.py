@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from claude_swap import macos_keychain
+from claude_swap import gateway, macos_keychain
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -31,6 +31,7 @@ from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
+    USAGE_GATEWAY,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
     USAGE_RELOGIN_REQUIRED,
@@ -289,6 +290,7 @@ SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
+    USAGE_GATEWAY: "custom endpoint (no usage fetched)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
 }
@@ -1997,6 +1999,12 @@ class ClaudeAccountSwitcher:
             n = str(num)
             if is_active:
                 active_number = n
+            record = (seq_data.get("accounts", {}) or {}).get(n, {})
+            gw = (
+                {k: record[k] for k in gateway.RECORD_FIELDS if record.get(k) is not None}
+                if record.get("kind") == "gateway"
+                else None
+            )
             accounts.append(
                 AccountSnapshot(
                     number=n,
@@ -2012,6 +2020,7 @@ class ClaudeAccountSwitcher:
                     login_expires_at=oauth.login_expires_at_epoch(creds),
                     policy=self._policy_from_data(seq_data, n),
                     subscription_plan=plans.get(n),
+                    gateway=gw,
                 )
             )
         return AccountsSnapshot(
@@ -3144,6 +3153,8 @@ class ClaudeAccountSwitcher:
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
+        if self._account_kind(str(num)) == "gateway":
+            return []
         if looks_like_api_key(creds):
             return []
         if is_active:
@@ -3650,16 +3661,20 @@ class ClaudeAccountSwitcher:
         return self._find_account_slot(data, email, organization_uuid) is not None
 
     def _account_kind(self, account_num: str | None) -> str:
-        """Stored kind for a managed slot: ``"api_key"`` or ``"oauth"`` (default).
+        """Stored kind for a managed slot: ``"gateway"``, ``"api_key"`` or
+        ``"oauth"`` (default).
 
-        Slots added before this field existed have no ``kind`` and read as
+        Slots added before the field existed have no ``kind`` and read as
         ``"oauth"`` (back-compat).
         """
         if account_num is None:
             return "oauth"
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num), {})
-        return "api_key" if record.get("kind") == "api_key" else "oauth"
+        kind = record.get("kind")
+        if kind == "gateway" or kind == "api_key":
+            return kind
+        return "oauth"
 
     def _reject_identity_drift_since_verify(
         self, verified: tuple[str, str, str]
@@ -4326,6 +4341,11 @@ class ClaudeAccountSwitcher:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
+        base_url: str | None = None,
+        auth: str = "bearer",
+        alias: str | None = None,
+        model: str | None = None,
+        small_fast_model: str | None = None,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -4350,6 +4370,14 @@ class ClaudeAccountSwitcher:
                    priority.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
+            base_url: When set, the token is a raw API key for a *gateway* — a
+                      custom Anthropic-compatible base URL — rather than a
+                      first-party setup-token or managed key. The key may carry
+                      any prefix. Requires ``--base-url``; the endpoint is
+                      validated (HTTPS, no embedded credentials/query/fragment).
+            auth: Gateway signing: ``bearer`` (an ``Authorization`` header) or
+                   ``x-api-key`` (an ``x-api-key`` header).
+            alias: Display alias for the gateway account.
         """
         self._refuse_session_shell()
         import getpass
@@ -4362,6 +4390,24 @@ class ClaudeAccountSwitcher:
         token = token.strip()
         if not token:
             raise ValidationError("Token cannot be empty")
+
+        # A gateway is a different beast from a first-party setup-token or
+        # managed key: it activates via a settings.json overlay, never the
+        # live credential store, and its key may carry any prefix. Hand it to
+        # its own handler before any API-key/OAuth auto-detection.
+        if base_url is not None:
+            self._add_gateway_account_from_token(
+                token,
+                email=email,
+                slot=slot,
+                base_url=base_url,
+                auth=auth,
+                alias=alias,
+                assume_yes=assume_yes,
+                model=model,
+                small_fast_model=small_fast_model,
+            )
+            return
 
         is_api_key = looks_like_api_key(token)
 
@@ -4549,6 +4595,136 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
+    def _add_gateway_account_from_token(
+        self,
+        token: str,
+        *,
+        email: str | None,
+        slot: int | None,
+        base_url: str,
+        auth: str,
+        alias: str | None,
+        assume_yes: bool = False,
+        model: str | None = None,
+        small_fast_model: str | None = None,
+    ) -> None:
+        """Register a gateway account: a custom Anthropic-compatible base URL
+        plus a raw API key (any prefix).
+
+        The key is stored raw in the per-slot backup store. Activation is a
+        ``settings.json`` overlay (handled at switch time, see
+        :mod:`claude_swap.gateway`) and never touches the live
+        ``.credentials.json``. Re-adding to the slot the same gateway email
+        already holds refreshes its key/endpoint in place.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
+
+        try:
+            fields = gateway.account_fields(
+                base_url, auth, model=model, small_fast_model=small_fast_model
+            )
+        except ValueError as exc:
+            raise ValidationError(f"Invalid gateway: {exc}") from None
+
+        if email and not self._validate_email(email):
+            raise ValidationError(f"Invalid email format: {email}")
+
+        if slot is None:
+            slot = self._get_next_account_number()
+        if slot < 1:
+            raise ConfigError("Slot number must be >= 1")
+        account_num = str(slot)
+
+        if not email:
+            label = alias if alias else "gateway"
+            email = f"{label}-{slot}@token.local"
+        organization_name = alias if alias else "gateway"
+
+        seq = self._get_sequence_data()
+        accounts = seq.get("accounts", {})
+        config = json.dumps(
+            {
+                "oauthAccount": {
+                    "emailAddress": email,
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }
+        )
+
+        # Same email already present: only a gateway slot at this same slot may
+        # be refreshed in place; anything else needs a distinct --email.
+        existing_num = self._find_account_slot(seq, email, "")
+        if existing_num is not None:
+            existing = accounts.get(existing_num, {})
+            if existing.get("kind") == "gateway":
+                carried = self._carried_settings(existing)
+                self._write_account_credentials(existing_num, email, token)
+                self._write_account_config(existing_num, email, config)
+                self._usage_store.clear_dead_token(
+                    [existing_num], {existing_num: (email, "")}
+                )
+                record = dict(existing)
+                record.update(fields)
+                record.update(carried)
+                record["organizationName"] = organization_name
+                seq["accounts"][existing_num] = record
+                seq["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, seq)
+                self._logger.info(
+                    f"Updated gateway for account {existing_num}: {email}"
+                )
+                print(
+                    f"{accent('Updated')} gateway for Account {existing_num} "
+                    f"({email} {muted('[personal]')})."
+                )
+                return
+            raise ValidationError(
+                f"'{email}' already exists as another account "
+                f"(slot {existing_num}); pass a distinct --email or free the slot."
+            )
+
+        # An explicitly requested, occupied slot is a data-loss risk: require
+        # the user to remove it first (gateways v1 do not displace).
+        if account_num in accounts and accounts[account_num].get("email") != email:
+            raise ConfigError(
+                f"Slot {account_num} is occupied by "
+                f"{accounts[account_num].get('email', 'unknown')}; "
+                "remove it or pick another slot."
+            )
+
+        self._write_account_credentials(account_num, email, token)
+        self._write_account_config(account_num, email, config)
+        self._usage_store.clear_dead_token([account_num], {account_num: (email, "")})
+
+        data = self._get_sequence_data()
+        record = {
+            "email": email,
+            "uuid": "",
+            "organizationUuid": "",
+            "organizationName": organization_name,
+            "added": get_timestamp(),
+        }
+        record.update(fields)
+        if alias:
+            record["alias"] = alias
+        data["accounts"][account_num] = record
+        if int(account_num) not in data["sequence"]:
+            data["sequence"].append(int(account_num))
+            data["sequence"].sort()
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(
+            f"Added gateway account {account_num}: {email} ({fields['baseUrl']})"
+        )
+        print(
+            f"{accent('Added')} gateway Account {account_num}: {email} "
+            f"{muted(f'[{gateway.tag(record)}]')} {muted('· [personal]')}"
+        )
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
 
@@ -4623,6 +4799,18 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
+        # If the removed slot is the live gateway, tear down its settings.json
+        # overlay first — otherwise Claude Code would keep a stale apiKeyHelper
+        # pointing at a slot whose stored key is about to be deleted.
+        if (
+            account_info.get("kind") == "gateway"
+            and self._active_gateway_slot() == account_num
+        ):
+            try:
+                gateway.write_settings(self.gateway_settings_path(), None)
+            except ValueError:
+                pass  # settings already inconsistent; removal proceeds regardless
+
         # Remove backup files
         self._delete_account_files(account_num, email)
 
@@ -4648,6 +4836,12 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
 
+        # A live gateway overlay is the effective "active" state: it routes
+        # traffic to a custom endpoint while the underlying login (the live
+        # credential) stays in place. Mark the gateway slot active — not the
+        # OAuth slot beneath it — so exactly one row reads active.
+        active_gateway = self._active_gateway_slot()
+
         # Find active account number by (email, organizationUuid) composite key
         active_num = None
         if current_identity is not None:
@@ -4665,9 +4859,17 @@ class ClaudeAccountSwitcher:
             org_name = account.get("organizationName", "") or ""
             org_uuid = account.get("organizationUuid", "") or ""
             alias = account.get("alias", "") or ""
-            is_active = str(num) == active_num
+            is_active = str(num) == active_gateway or (
+                active_gateway is None and str(num) == active_num
+            )
 
-            if is_active:
+            if is_active and str(num) == active_gateway:
+                # The gateway is "active" via the settings overlay, so its
+                # credential is the stored key — not the live login it overlays.
+                # No OAuth verdict to record for it (sentinel is derived from kind).
+                creds = self._read_account_credentials(str(num), email, cached=True)
+                self._record_active_verdict(None)
+            elif is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
@@ -5398,6 +5600,11 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
+        # Gateway seat: its key is opaque to the first-party quota endpoint, so
+        # mark it before the credential-shape checks (a gateway key may carry
+        # any prefix, including one ``looks_like_api_key`` would not match).
+        if self._account_kind(num) == "gateway":
+            return USAGE_GATEWAY
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -6158,6 +6365,10 @@ class ClaudeAccountSwitcher:
             if is_active:
                 active_num = num
             entry = entries[str(num)]
+            record = (seq_data.get("accounts", {}) or {}).get(str(num), {})
+            gw = None
+            if record.get("kind") == "gateway" and record.get("baseUrl"):
+                gw = {k: record[k] for k in gateway.RECORD_FIELDS if record.get(k) is not None}
             # JSON carries the decision-grade value: last-good only while it is
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
@@ -6178,6 +6389,7 @@ class ClaudeAccountSwitcher:
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     subscription_plan=(plans or {}).get(str(num)),
+                    gateway=gw,
                 )
             )
         payload = {
@@ -6236,7 +6448,11 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
-            tag = self._get_display_tag(email, org_name, org_uuid)
+            record = (seq_data.get("accounts", {}) or {}).get(str(num), {})
+            if record.get("kind") == "gateway" and record.get("baseUrl"):
+                tag = gateway.tag(record)
+            else:
+                tag = self._get_display_tag(email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
             if is_active:
@@ -6321,11 +6537,36 @@ class ClaudeAccountSwitcher:
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
         identity = self._get_current_account()
+        data = self._get_sequence_data_migrated() or {}
+
+        # A live gateway overlay is the effective active state and takes
+        # precedence over the raw credential identity beneath it (which may even
+        # be absent — a gateway has no first-party quota to report).
+        active_gw = self._active_gateway_slot() if data else None
+        if active_gw is not None and active_gw in data.get("accounts", {}):
+            acct = data["accounts"][active_gw]
+            gw = {k: acct[k] for k in gateway.RECORD_FIELDS if acct.get(k) is not None}
+            active_payload: dict = {
+                "number": int(active_gw),
+                "email": acct.get("email", ""),
+                "kind": "gateway",
+                "gateway": gw,
+                "managed": True,
+                "usageStatus": "gateway",
+                "usage": None,
+            }
+            if acct.get("alias"):
+                active_payload["alias"] = acct["alias"]
+            return {
+                "schemaVersion": SCHEMA_VERSION,
+                "active": active_payload,
+                "totalManagedAccounts": len(data.get("accounts", {})),
+            }
+
         if identity is None:
             return {"schemaVersion": SCHEMA_VERSION, "active": None}
         current_email, current_org_uuid = identity
 
-        data = self._get_sequence_data_migrated()
         if not data:
             return {
                 "schemaVersion": SCHEMA_VERSION,
@@ -6384,6 +6625,24 @@ class ClaudeAccountSwitcher:
         """Display current account status (or return the schema-v1 payload)."""
         if json_output:
             return self._build_status_payload()
+
+        # A live gateway overlay takes precedence over the raw identity — and
+        # may be the only "active" state (there is no first-party login beneath
+        # it that the status should report instead).
+        data0 = self._get_sequence_data_migrated() or {}
+        active_gw = self._active_gateway_slot() if data0 else None
+        if active_gw is not None and active_gw in (data0.get("accounts") or {}):
+            acct = data0["accounts"][active_gw]
+            email = acct.get("email", "")
+            tag = gateway.tag(acct)
+            total = len(data0.get("accounts", {}))
+            print(
+                f"{bolded('Status:')} {accent(f'Account-{active_gw}')} "
+                f"({email} {muted(f'[{tag}]')})"
+            )
+            print(f"  {dimmed(f'Total managed accounts: {total}')}")
+            print(f"  {dimmed('Gateway custom endpoint (no quota fetched)')}")
+            return None
 
         identity = self._get_current_account()
         if identity is None:
@@ -6945,6 +7204,48 @@ class ClaudeAccountSwitcher:
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
+        # --- Gateway gating ----------------------------------------------------
+        # A gateway is never activated by swapping the live credential — it is a
+        # settings.json overlay that points Claude Code at a custom endpoint. So
+        # a gateway target takes its own path (below), and leaving a live
+        # gateway first tears down the overlay, so the next seat routes to the
+        # first-party URL rather than the old gateway. The live
+        # ``.credentials.json`` is left untouched in both directions.
+        active_gw = self._active_gateway_slot()
+        if self._account_kind(target_account) == "gateway":
+            g_email = data["accounts"][target_account].get("email", "")
+            g_ref = account_ref(int(target_account), g_email)
+            if active_gw == target_account and not force:
+                if json_output:
+                    return self._switch_noop(
+                        strategy="direct",
+                        reason="already-active",
+                        to_ref=g_ref,
+                        message=f"Already on gateway Account-{target_account} ({g_email})",
+                    )
+                print(
+                    f"{accent('Already on')} gateway Account-{target_account} ({g_email})"
+                )
+                return None
+            if json_output:
+                from_ref = self._gateway_switch_from_ref()
+                self._perform_gateway_switch(target_account, emit_output=False)
+                return self._switch_result_from_op(
+                    {"from": from_ref, "to": g_ref, "warnings": []}, "direct"
+                )
+            self._perform_gateway_switch(target_account, emit_output=True)
+            return None
+
+        if active_gw is not None:
+            settings_path = self.gateway_settings_path()
+            prev_bytes = settings_path.read_bytes() if settings_path.exists() else None
+            try:
+                gateway.write_settings(settings_path, None)
+            except Exception:
+                if prev_bytes is not None:
+                    gateway.restore_settings(settings_path, prev_bytes)
+                raise
+
         # Short-circuit a no-op before mutating (issue #79). A self-switch
         # would first back up the live credentials into the target slot —
         # destroying a freshly imported backup with a possibly stale login —
@@ -7006,6 +7307,103 @@ class ClaudeAccountSwitcher:
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
         return result
+
+    def gateway_settings_path(self) -> Path:
+        """The Claude user-level ``settings.json`` a gateway overlay targets."""
+        from claude_swap import paths
+
+        return paths.get_claude_config_home() / "settings.json"
+
+    def _active_gateway_slot(self) -> str | None:
+        """The slot whose gateway overlay is currently live, or ``None``.
+
+        A slot counts as an active gateway only when ``settings.json`` both names
+        it in ``apiKeyHelper`` and still points ``ANTHROPIC_BASE_URL`` at that
+        slot's recorded base URL.
+        """
+        data = self._get_sequence_data() or {}
+        return gateway.active_slot(
+            self.gateway_settings_path(), data.get("accounts", {})
+        )
+
+    def _gateway_switch_from_ref(self) -> dict:
+        """The ``from`` account ref for a gateway switch's JSON result."""
+        data = self._get_sequence_data() or {}
+        identity = self._get_current_account()
+        if identity is not None:
+            cur = self._find_account_slot(data, identity[0], identity[1])
+            if cur:
+                return account_ref(int(cur), data["accounts"][cur].get("email", ""))
+        active_gw = self._active_gateway_slot()
+        if active_gw:
+            return account_ref(
+                int(active_gw), data["accounts"].get(active_gw, {}).get("email", "")
+            )
+        # Nothing was active before: an out-of-range slot makes from != to, so a
+        # first activation reports switched=True rather than a self no-op.
+        return account_ref(0, "")
+
+    def _perform_gateway_switch(
+        self, target_account: str, *, emit_output: bool = True
+    ) -> None:
+        """Activate a gateway by writing the ``settings.json`` overlay.
+
+        The live credential store is never touched: the saved Claude login stays
+        in place, and only ``apiKeyHelper`` + ``env.ANTHROPIC_BASE_URL`` change
+        to redirect traffic at the custom endpoint. A refused activation
+        (foreign ``apiKeyHelper``, auth-override env vars, unreadable settings)
+        restores the previous overlay and raises ``SwitchError``.
+        """
+        settings_path = self.gateway_settings_path()
+        original_bytes = settings_path.read_bytes() if settings_path.exists() else None
+        with FileLock(self.lock_file, 10.0):
+            data = self._get_sequence_data()
+            record = data.get("accounts", {}).get(target_account)
+            if (
+                not record
+                or record.get("kind") != "gateway"
+                or not record.get("baseUrl")
+            ):
+                raise ConfigError(f"Account-{target_account} is not a gateway account")
+            try:
+                gateway.write_settings(settings_path, target_account, record)
+            except ValueError as exc:
+                gateway.restore_settings(settings_path, original_bytes)
+                raise SwitchError(str(exc)) from None
+            data["activeAccountNumber"] = int(target_account)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            if emit_output:
+                email = record.get("email", "")
+                print(
+                    f"{accent('Switched to')} gateway Account-{target_account} "
+                    f"({email})"
+                )
+                print(
+                    dimmed(
+                        f"Endpoint: {record['baseUrl']} "
+                        f"({record.get('auth', 'bearer')}) — switch back to a "
+                        "Claude account to restore the first-party endpoint."
+                    )
+                )
+
+    def gateway_credential(self, slot: str) -> str:
+        """The stored raw key for a managed gateway slot (for ``apiKeyHelper``).
+
+        Raises ``SwitchError`` when the slot is missing, is not a gateway, or its
+        stored key cannot be read — the hidden ``gateway-credential`` entry point
+        turns that into a failed helper invocation (exit 1), which Claude Code
+        sees as "no API key".
+        """
+        num = str(slot)
+        data = self._get_sequence_data() or {}
+        record = (data.get("accounts") or {}).get(num)
+        if record is None or record.get("kind") != "gateway":
+            raise SwitchError(f"Slot {slot} has no managed gateway credentials")
+        key = self._read_account_credentials(num, record.get("email", ""))
+        if not key or not key.strip():
+            raise SwitchError(f"Slot {slot}'s gateway key could not be read")
+        return key.strip()
 
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
         """Whether the live credential is provably the slot's stored lineage.
